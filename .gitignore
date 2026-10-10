@@ -1,0 +1,31 @@
+# Compiled programs and objects
+/lamepaste
+*.o
+*.so
+*.a
+*.core
+core
+
+# Build directories
+/build/
+/cmake-build-*/
+
+# SQLite databases and sidecar files (may contain private history)
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+*~
+*.swp
+*.swo
+.DS_Store
