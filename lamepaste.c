@@ -1,10 +1,11 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <pwd.h>
-#include <signal.h>
+#include <pthread.h>
 #include <sqlite3.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,13 +17,145 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef HAVE_X11
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+#endif
+
 #define APP_NAME "lamepaste"
+#define APP_VERSION "1.2.1"
 #define DEFAULT_HISTORY_LIMIT 20
 #define MAX_HISTORY_LIMIT 100000
 #define INPUT_CHUNK_SIZE 16384
 #define PREVIEW_BYTES 72
 
 static const char *g_db_path = NULL;
+
+/* A small Rich-inspired transient progress renderer. It writes only to stderr,
+ * activates only for an interactive terminal, and never estimates completion
+ * for work whose total is unknown. */
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_t thread;
+    int active;
+    int running;
+    int color;
+    size_t bytes;
+    size_t total;
+    char phase[96];
+} Progress;
+
+static Progress g_progress = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, "" };
+static const char *const progress_frames[] = {
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"
+};
+
+static void *progress_worker(void *unused)
+{
+    size_t frame = 0;
+    (void)unused;
+    for (;;) {
+        char phase[sizeof(g_progress.phase)];
+        size_t bytes, total;
+        int running, color;
+        struct timespec delay = {0, 120000000L};
+        (void)pthread_mutex_lock(&g_progress.mutex);
+        running = g_progress.running;
+        color = g_progress.color;
+        bytes = g_progress.bytes;
+        total = g_progress.total;
+        (void)snprintf(phase, sizeof(phase), "%s", g_progress.phase);
+        (void)pthread_mutex_unlock(&g_progress.mutex);
+        if (!running)
+            break;
+        if (g_progress.active) {
+            if (total != 0) {
+                size_t done = bytes < total ? bytes : total;
+                size_t filled = (done * 18U) / total;
+                size_t percent = (done * 100U) / total;
+                size_t j;
+                fprintf(stderr, "\r\033[2K%s%s%s  %-18s  ", color ? "\033[36m" : "", progress_frames[frame], color ? "\033[0m" : "", phase);
+                for (j = 0; j < 18; ++j)
+                    fputs(j < filled ? "━" : "─", stderr);
+                fprintf(stderr, "  %3zu%%  %zu/%zu bytes", percent, done, total);
+            } else if (bytes != 0) {
+                fprintf(stderr, "\r\033[2K%s%s%s  %-22s  %zu bytes", color ? "\033[36m" : "", progress_frames[frame], color ? "\033[0m" : "", phase, bytes);
+            } else {
+                fprintf(stderr, "\r\033[2K%s%s%s  %s", color ? "\033[36m" : "", progress_frames[frame], color ? "\033[0m" : "", phase);
+            }
+            fflush(stderr);
+            frame = (frame + 1) % (sizeof(progress_frames) / sizeof(progress_frames[0]));
+        }
+        (void)nanosleep(&delay, NULL);
+    }
+    return NULL;
+}
+
+static void progress_start(const char *phase)
+{
+    if (!isatty(STDERR_FILENO))
+        return;
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    g_progress.active = 1;
+    g_progress.running = 1;
+    g_progress.color = getenv("NO_COLOR") == NULL;
+    g_progress.bytes = 0;
+    g_progress.total = 0;
+    (void)snprintf(g_progress.phase, sizeof(g_progress.phase), "%s", phase);
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+    if (pthread_create(&g_progress.thread, NULL, progress_worker, NULL) != 0) {
+        (void)pthread_mutex_lock(&g_progress.mutex);
+        g_progress.active = 0;
+        g_progress.running = 0;
+        (void)pthread_mutex_unlock(&g_progress.mutex);
+    }
+}
+
+static void progress_phase(const char *phase)
+{
+    if (!g_progress.active)
+        return;
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    g_progress.bytes = 0;
+    g_progress.total = 0;
+    (void)snprintf(g_progress.phase, sizeof(g_progress.phase), "%s", phase);
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+}
+
+static void progress_total(size_t total)
+{
+    if (!g_progress.active)
+        return;
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    g_progress.total = total;
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+}
+
+static void progress_bytes(size_t bytes)
+{
+    if (!g_progress.active)
+        return;
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    g_progress.bytes = bytes;
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+}
+
+static void progress_stop(void)
+{
+    int active;
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    active = g_progress.active;
+    g_progress.running = 0;
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+    if (active) {
+        (void)pthread_join(g_progress.thread, NULL);
+        fputs("\r\033[2K", stderr);
+        fflush(stderr);
+    }
+    (void)pthread_mutex_lock(&g_progress.mutex);
+    g_progress.active = 0;
+    (void)pthread_mutex_unlock(&g_progress.mutex);
+}
 
 typedef enum {
     ACTION_PIPE = 0,
@@ -42,13 +175,15 @@ typedef struct {
 static void print_usage(FILE *out)
 {
     fprintf(out,
+        "01101100 01100001 01101101 01100101 01110010\n"
+        "LAMERPASTE " APP_VERSION "\n"
         "Usage:\n"
         "  command | " APP_NAME " [--db PATH] [--no-clipboard]\n"
         "  " APP_NAME " [--db PATH] --history [N]\n"
         "  " APP_NAME " [--db PATH] --show ID\n"
         "  " APP_NAME " [--db PATH] --restore ID [--no-clipboard]\n"
         "\n"
-        "With piped input, " APP_NAME " saves the exact input bytes and local\n"
+        "With piped or redirected input, " APP_NAME " saves the exact bytes and local\n"
         "date/time to a private SQLite history database, then copies the input\n"
         "to the system clipboard.\n"
         "\n"
@@ -144,6 +279,7 @@ static int read_all_stdin(Buffer *b)
         }
         if (buffer_append(b, chunk, (size_t)n) != 0)
             return -1;
+        progress_bytes(b->len);
     }
 }
 
@@ -338,12 +474,15 @@ static int insert_clip(sqlite3 *db, const unsigned char *data, size_t len, sqlit
         fprintf(stderr, APP_NAME ": SQLite prepare failed: %s\n", sqlite3_errmsg(db));
         return -1;
     }
-    sqlite3_bind_text(stmt, 1, timestamp, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)len);
-    if (len == 0)
-        rc = sqlite3_bind_zeroblob(stmt, 3, 0);
-    else
-        rc = sqlite3_bind_blob64(stmt, 3, data, (sqlite3_uint64)len, SQLITE_TRANSIENT);
+    rc = sqlite3_bind_text(stmt, 1, timestamp, -1, SQLITE_TRANSIENT);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(stmt, 2, (sqlite3_int64)len);
+    if (rc == SQLITE_OK) {
+        if (len == 0)
+            rc = sqlite3_bind_zeroblob(stmt, 3, 0);
+        else
+            rc = sqlite3_bind_blob64(stmt, 3, data, (sqlite3_uint64)len, SQLITE_TRANSIENT);
+    }
     if (rc != SQLITE_OK) {
         fprintf(stderr, APP_NAME ": SQLite bind failed: %s\n", sqlite3_errmsg(db));
         sqlite3_finalize(stmt);
@@ -362,44 +501,6 @@ static int insert_clip(sqlite3 *db, const unsigned char *data, size_t len, sqlit
     if (rc != SQLITE_OK) {
         fprintf(stderr, APP_NAME ": SQLite finalize failed: %s\n", sqlite3_errmsg(db));
         return -1;
-    }
-    return 0;
-}
-
-static int command_exists(const char *command)
-{
-    const char *path_env;
-    const char *cursor;
-    size_t command_len;
-
-    if (strchr(command, '/') != NULL)
-        return access(command, X_OK) == 0;
-
-    path_env = getenv("PATH");
-    if (path_env == NULL)
-        return 0;
-    command_len = strlen(command);
-    cursor = path_env;
-    while (1) {
-        const char *end = strchr(cursor, ':');
-        size_t dir_len = end ? (size_t)(end - cursor) : strlen(cursor);
-        size_t alloc_len = (dir_len ? dir_len : 1) + 1 + command_len + 1;
-        char *candidate = malloc(alloc_len);
-        int found = 0;
-
-        if (candidate == NULL)
-            return 0;
-        if (dir_len == 0)
-            (void)snprintf(candidate, alloc_len, "./%s", command);
-        else
-            (void)snprintf(candidate, alloc_len, "%.*s/%s", (int)dir_len, cursor, command);
-        found = access(candidate, X_OK) == 0;
-        free(candidate);
-        if (found)
-            return 1;
-        if (end == NULL)
-            break;
-        cursor = end + 1;
     }
     return 0;
 }
@@ -423,6 +524,27 @@ static int write_all(int fd, const unsigned char *data, size_t len)
     return 0;
 }
 
+#ifdef HAVE_X11
+static int read_all_fd(int fd, unsigned char *data, size_t len)
+{
+    size_t offset = 0;
+    while (offset < len) {
+        ssize_t n = read(fd, data + offset, len - offset);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0) {
+            errno = EPIPE;
+            return -1;
+        }
+        offset += (size_t)n;
+    }
+    return 0;
+}
+#endif
+
 static int wait_for_child(pid_t pid, int *status)
 {
     while (waitpid(pid, status, 0) < 0) {
@@ -433,160 +555,386 @@ static int wait_for_child(pid_t pid, int *status)
     return 0;
 }
 
-/* Feed bytes directly to an external clipboard utility without invoking a shell. */
-static int run_clipboard_command(char *const argv[], const unsigned char *data,
-                                 size_t len, char *why, size_t why_size)
+#ifdef HAVE_X11
+#define X11_TRANSFER_CHUNK (64U * 1024U)
+#define X11_MAX_TRANSFERS 128U
+
+typedef struct X11Transfer {
+    Window requestor;
+    Atom property;
+    Atom target;
+    size_t offset;
+    size_t length;
+    struct X11Transfer *next;
+} X11Transfer;
+
+typedef struct {
+    int status;
+    int error_number;
+    char message[160];
+} ClipboardStartup;
+
+static int x11_error_seen;
+
+static int x11_error_handler(Display *display, XErrorEvent *event)
 {
-    int input_pipe[2] = {-1, -1};
-    int exec_pipe[2] = {-1, -1};
-    pid_t pid;
-    int exec_errno = 0;
-    ssize_t exec_read;
-    int status = 0;
-    int write_error = 0;
+    (void)display;
+    x11_error_seen = event->error_code;
+    return 0;
+}
 
-    if (pipe(input_pipe) != 0) {
-        (void)snprintf(why, why_size, "pipe failed: %s", strerror(errno));
+static void x11_send_notify(Display *display, XSelectionRequestEvent *request,
+                            Atom property)
+{
+    XEvent reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.xselection.type = SelectionNotify;
+    reply.xselection.display = request->display;
+    reply.xselection.requestor = request->requestor;
+    reply.xselection.selection = request->selection;
+    reply.xselection.target = request->target;
+    reply.xselection.property = property;
+    reply.xselection.time = request->time;
+    (void)XSendEvent(display, request->requestor, False, 0, &reply);
+    (void)XFlush(display);
+}
+
+static size_t x11_max_property_bytes(Display *display)
+{
+    long units = XMaxRequestSize(display);
+    size_t bytes;
+    if (units <= 0)
+        return X11_TRANSFER_CHUNK;
+    bytes = (size_t)units * 4U;
+    return bytes > 1024U ? bytes - 1024U : X11_TRANSFER_CHUNK;
+}
+
+static int x11_start_incr(Display *display, XSelectionRequestEvent *request,
+                          Atom property, Atom incr_atom, Atom target,
+                          size_t len, X11Transfer **transfers)
+{
+    X11Transfer *transfer;
+    X11Transfer *scan;
+    unsigned long total;
+    size_t active = 0;
+
+    for (scan = *transfers; scan != NULL; scan = scan->next)
+        ++active;
+    if (active >= X11_MAX_TRANSFERS) {
+        x11_send_notify(display, request, None);
         return -1;
     }
-    if (pipe(exec_pipe) != 0) {
-        int saved = errno;
-        close(input_pipe[0]);
-        close(input_pipe[1]);
-        (void)snprintf(why, why_size, "pipe failed: %s", strerror(saved));
+    if (len > UINT32_MAX) {
+        x11_send_notify(display, request, None);
         return -1;
     }
-    if (fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC) == -1) {
-        int saved = errno;
-        close(input_pipe[0]); close(input_pipe[1]);
-        close(exec_pipe[0]); close(exec_pipe[1]);
-        (void)snprintf(why, why_size, "fcntl failed: %s", strerror(saved));
+    transfer = calloc(1, sizeof(*transfer));
+    if (transfer == NULL) {
+        x11_send_notify(display, request, None);
         return -1;
+    }
+    transfer->requestor = request->requestor;
+    transfer->property = property;
+    transfer->target = target;
+    transfer->length = len;
+    transfer->next = *transfers;
+    *transfers = transfer;
+
+    total = (unsigned long)len;
+    x11_error_seen = 0;
+    XSelectInput(display, request->requestor, PropertyChangeMask | StructureNotifyMask);
+    XChangeProperty(display, request->requestor, property, incr_atom, 32,
+                    PropModeReplace, (unsigned char *)&total, 1);
+    XSync(display, False);
+    if (x11_error_seen != 0) {
+        *transfers = transfer->next;
+        free(transfer);
+        x11_send_notify(display, request, None);
+        return -1;
+    }
+    x11_send_notify(display, request, property);
+    return 0;
+}
+
+static void x11_handle_selection_request(Display *display,
+                                         XSelectionRequestEvent *request,
+                                         Atom clipboard_atom, Atom targets_atom,
+                                         Atom utf8_atom, Atom text_atom,
+                                         Atom octet_atom, Atom incr_atom,
+                                         const unsigned char *data, size_t len,
+                                         X11Transfer **transfers)
+{
+    Atom property = request->property != None ? request->property : request->target;
+    Atom offered[5];
+    size_t max_bytes = x11_max_property_bytes(display);
+
+    if (request->selection != clipboard_atom) {
+        x11_send_notify(display, request, None);
+        return;
     }
 
-    pid = fork();
-    if (pid < 0) {
-        int saved = errno;
-        close(input_pipe[0]); close(input_pipe[1]);
-        close(exec_pipe[0]); close(exec_pipe[1]);
-        (void)snprintf(why, why_size, "fork failed: %s", strerror(saved));
-        return -1;
+    if (request->target == targets_atom) {
+        offered[0] = targets_atom;
+        offered[1] = utf8_atom;
+        offered[2] = XA_STRING;
+        offered[3] = text_atom;
+        offered[4] = octet_atom;
+        XChangeProperty(display, request->requestor, property, XA_ATOM, 32,
+                        PropModeReplace, (unsigned char *)offered, 5);
+        x11_send_notify(display, request, property);
+        return;
     }
 
-    if (pid == 0) {
-        int saved;
-        close(input_pipe[1]);
-        close(exec_pipe[0]);
-        (void)signal(SIGPIPE, SIG_DFL);
-        if (dup2(input_pipe[0], STDIN_FILENO) < 0) {
-            saved = errno;
-            (void)write(exec_pipe[1], &saved, sizeof(saved));
-            _exit(127);
+    if (request->target != utf8_atom && request->target != XA_STRING &&
+        request->target != text_atom && request->target != octet_atom) {
+        x11_send_notify(display, request, None);
+        return;
+    }
+
+    if (len <= max_bytes && len <= (size_t)INT_MAX) {
+        XChangeProperty(display, request->requestor, property, request->target, 8,
+                        PropModeReplace, (const unsigned char *)data, (int)len);
+        x11_send_notify(display, request, property);
+        return;
+    }
+
+    (void)x11_start_incr(display, request, property, incr_atom, request->target,
+                         len, transfers);
+}
+
+static void x11_handle_property_delete(Display *display, XPropertyEvent *event,
+                                       const unsigned char *data,
+                                       X11Transfer **transfers)
+{
+    X11Transfer **cursor = transfers;
+    size_t chunk;
+
+    while (*cursor != NULL) {
+        X11Transfer *transfer = *cursor;
+        if (transfer->requestor != event->window || transfer->property != event->atom) {
+            cursor = &transfer->next;
+            continue;
         }
-        close(input_pipe[0]);
-        execvp(argv[0], argv);
-        saved = errno;
-        (void)write(exec_pipe[1], &saved, sizeof(saved));
-        _exit(127);
+
+        if (transfer->offset < transfer->length) {
+            chunk = transfer->length - transfer->offset;
+            size_t max_chunk = x11_max_property_bytes(display);
+            if (max_chunk > X11_TRANSFER_CHUNK)
+                max_chunk = X11_TRANSFER_CHUNK;
+            if (chunk > max_chunk)
+                chunk = max_chunk;
+            XChangeProperty(display, transfer->requestor, transfer->property,
+                            transfer->target, 8, PropModeReplace,
+                            data + transfer->offset, (int)chunk);
+            transfer->offset += chunk;
+        } else {
+            XChangeProperty(display, transfer->requestor, transfer->property,
+                            transfer->target, 8, PropModeReplace,
+                            (const unsigned char *)"", 0);
+            *cursor = transfer->next;
+            free(transfer);
+        }
+        XFlush(display);
+        return;
+    }
+}
+
+static void x11_clipboard_owner(const unsigned char *data, size_t len, int status_fd)
+{
+    Display *display;
+    Window owner;
+    Atom clipboard_atom, targets_atom, utf8_atom, text_atom, octet_atom, incr_atom;
+    X11Transfer *transfers = NULL;
+    ClipboardStartup startup;
+    XEvent event;
+
+    memset(&startup, 0, sizeof(startup));
+    display = XOpenDisplay(NULL);
+    if (display == NULL) {
+        startup.status = -1;
+        startup.error_number = errno;
+        (void)snprintf(startup.message, sizeof(startup.message),
+                       "cannot connect to DISPLAY (X11/XWayland)");
+        (void)write_all(status_fd, (const unsigned char *)&startup, sizeof(startup));
+        _exit(1);
     }
 
-    close(input_pipe[0]);
-    close(exec_pipe[1]);
+    XSetErrorHandler(x11_error_handler);
+    x11_error_seen = 0;
+    clipboard_atom = XInternAtom(display, "CLIPBOARD", False);
+    targets_atom = XInternAtom(display, "TARGETS", False);
+    utf8_atom = XInternAtom(display, "UTF8_STRING", False);
+    text_atom = XInternAtom(display, "TEXT", False);
+    octet_atom = XInternAtom(display, "application/octet-stream", False);
+    incr_atom = XInternAtom(display, "INCR", False);
+    owner = XCreateSimpleWindow(display, DefaultRootWindow(display), 0, 0, 1, 1,
+                                0, 0, 0);
+    x11_error_seen = 0;
+    XSetSelectionOwner(display, clipboard_atom, owner, CurrentTime);
+    XSync(display, False);
+    if (x11_error_seen != 0 || XGetSelectionOwner(display, clipboard_atom) != owner) {
+        startup.status = -1;
+        (void)snprintf(startup.message, sizeof(startup.message),
+                       "X server refused clipboard ownership");
+        (void)write_all(status_fd, (const unsigned char *)&startup, sizeof(startup));
+        XDestroyWindow(display, owner);
+        XCloseDisplay(display);
+        _exit(1);
+    }
 
-    /* EOF here means exec succeeded (the descriptor is close-on-exec). */
-    do {
-        exec_read = read(exec_pipe[0], &exec_errno, sizeof(exec_errno));
-    } while (exec_read < 0 && errno == EINTR);
-    close(exec_pipe[0]);
+    startup.status = 0;
+    (void)write_all(status_fd, (const unsigned char *)&startup, sizeof(startup));
+    close(status_fd);
 
-    if (exec_read > 0) {
-        close(input_pipe[1]);
-        (void)wait_for_child(pid, &status);
-        (void)snprintf(why, why_size, "could not start %s: %s", argv[0], strerror(exec_errno));
+    for (;;) {
+        XNextEvent(display, &event);
+        if (event.type == SelectionRequest) {
+            x11_handle_selection_request(display, &event.xselectionrequest,
+                clipboard_atom, targets_atom, utf8_atom, text_atom, octet_atom,
+                incr_atom, data, len, &transfers);
+        } else if (event.type == PropertyNotify &&
+                   event.xproperty.state == PropertyDelete) {
+            x11_handle_property_delete(display, &event.xproperty, data, &transfers);
+        } else if (event.type == SelectionClear &&
+                   event.xselectionclear.selection == clipboard_atom) {
+            break;
+        } else if (event.type == DestroyNotify) {
+            X11Transfer **cursor = &transfers;
+            while (*cursor != NULL) {
+                if ((*cursor)->requestor == event.xdestroywindow.window) {
+                    X11Transfer *dead = *cursor;
+                    *cursor = dead->next;
+                    free(dead);
+                } else {
+                    cursor = &(*cursor)->next;
+                }
+            }
+        }
+    }
+
+    while (transfers != NULL) {
+        X11Transfer *next = transfers->next;
+        free(transfers);
+        transfers = next;
+    }
+    XDestroyWindow(display, owner);
+    XCloseDisplay(display);
+    _exit(0);
+}
+
+static void close_fds_except(int keep_fd)
+{
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    int fd;
+    if (max_fd < 0 || max_fd > 65536)
+        max_fd = 65536;
+    for (fd = 0; fd < max_fd; ++fd) {
+        if (fd != keep_fd)
+            close(fd);
+    }
+}
+
+static int copy_to_clipboard(const unsigned char *data, size_t len,
+                             char *why, size_t why_size)
+{
+    int status_pipe[2] = {-1, -1};
+    pid_t first_child;
+    ClipboardStartup startup;
+
+    if (getenv("DISPLAY") == NULL || *getenv("DISPLAY") == '\0') {
+        if (getenv("WAYLAND_DISPLAY") != NULL && *getenv("WAYLAND_DISPLAY") != '\0') {
+            (void)snprintf(why, why_size,
+                "Wayland session detected, but DISPLAY is unavailable; this build uses native X11/XWayland access and needs XWayland enabled");
+        } else {
+            (void)snprintf(why, why_size,
+                "no X11 display is available; this build uses native X11/XWayland clipboard access");
+        }
         return -1;
     }
-    if (exec_read < 0) {
+    if (len > UINT32_MAX) {
+        (void)snprintf(why, why_size,
+            "clipboard payload exceeds the X11 INCR protocol size limit");
+        return -1;
+    }
+    if (pipe(status_pipe) != 0) {
+        (void)snprintf(why, why_size, "clipboard status pipe failed: %s", strerror(errno));
+        return -1;
+    }
+    first_child = fork();
+    if (first_child < 0) {
         int saved = errno;
-        close(input_pipe[1]);
-        (void)wait_for_child(pid, &status);
-        (void)snprintf(why, why_size, "could not verify launch of %s: %s", argv[0], strerror(saved));
+        close(status_pipe[0]); close(status_pipe[1]);
+        (void)snprintf(why, why_size, "clipboard owner fork failed: %s", strerror(saved));
         return -1;
+    }
+    if (first_child == 0) {
+        pid_t daemon_child;
+        int null_fd;
+        close(status_pipe[0]);
+        if (setsid() < 0) {
+            memset(&startup, 0, sizeof(startup));
+            startup.status = -1;
+            startup.error_number = errno;
+            (void)snprintf(startup.message, sizeof(startup.message), "setsid failed: %s", strerror(errno));
+            (void)write_all(status_pipe[1], (const unsigned char *)&startup, sizeof(startup));
+            _exit(1);
+        }
+        daemon_child = fork();
+        if (daemon_child < 0) {
+            memset(&startup, 0, sizeof(startup));
+            startup.status = -1;
+            startup.error_number = errno;
+            (void)snprintf(startup.message, sizeof(startup.message), "clipboard daemon fork failed: %s", strerror(errno));
+            (void)write_all(status_pipe[1], (const unsigned char *)&startup, sizeof(startup));
+            _exit(1);
+        }
+        if (daemon_child > 0) {
+            close(status_pipe[1]);
+            _exit(0);
+        }
+        close_fds_except(status_pipe[1]);
+        null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDIN_FILENO);
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO)
+                close(null_fd);
+        }
+        x11_clipboard_owner(data, len, status_pipe[1]);
+        _exit(1);
     }
 
-    if (len != 0 && write_all(input_pipe[1], data, len) != 0)
-        write_error = errno;
-    if (close(input_pipe[1]) != 0 && write_error == 0)
-        write_error = errno;
-
-    if (wait_for_child(pid, &status) != 0) {
-        (void)snprintf(why, why_size, "waiting for %s failed: %s", argv[0], strerror(errno));
+    close(status_pipe[1]);
+    if (read_all_fd(status_pipe[0], (unsigned char *)&startup, sizeof(startup)) != 0) {
+        int saved = errno;
+        int child_status = 0;
+        close(status_pipe[0]);
+        (void)wait_for_child(first_child, &child_status);
+        (void)snprintf(why, why_size,
+            "clipboard owner exited before confirming startup: %s", strerror(saved));
         return -1;
     }
-    if (write_error != 0) {
-        (void)snprintf(why, why_size, "writing clipboard data failed: %s", strerror(write_error));
-        return -1;
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (WIFSIGNALED(status))
-            (void)snprintf(why, why_size, "%s terminated by signal %d", argv[0], WTERMSIG(status));
-        else
-            (void)snprintf(why, why_size, "%s exited with status %d", argv[0],
-                           WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    close(status_pipe[0]);
+    (void)wait_for_child(first_child, &(int){0});
+    if (startup.status != 0) {
+        (void)snprintf(why, why_size, "%s", startup.message[0] ? startup.message :
+                       "native clipboard owner failed to start");
         return -1;
     }
     return 0;
 }
-
-static int copy_to_clipboard(const unsigned char *data, size_t len, char *why, size_t why_size)
+#else
+static int copy_to_clipboard(const unsigned char *data, size_t len,
+                             char *why, size_t why_size)
 {
-    char *wl_argv[] = {(char *)"wl-copy", NULL};
-    char *xclip_argv[] = {(char *)"xclip", (char *)"-selection", (char *)"clipboard", (char *)"-in", NULL};
-    char *xsel_argv[] = {(char *)"xsel", (char *)"--clipboard", (char *)"--input", NULL};
-    int wayland = getenv("WAYLAND_DISPLAY") != NULL && *getenv("WAYLAND_DISPLAY") != '\0';
-    int x11 = getenv("DISPLAY") != NULL && *getenv("DISPLAY") != '\0';
-    int tried = 0;
-    char last_error[256] = "no supported clipboard program found";
-
-    if (wayland && command_exists("wl-copy")) {
-        tried = 1;
-        if (run_clipboard_command(wl_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-    if (x11 && command_exists("xclip")) {
-        tried = 1;
-        if (run_clipboard_command(xclip_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-    if (x11 && command_exists("xsel")) {
-        tried = 1;
-        if (run_clipboard_command(xsel_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-    /* Last-chance attempts also help in nested/mixed desktop sessions. */
-    if (!wayland && command_exists("wl-copy")) {
-        tried = 1;
-        if (run_clipboard_command(wl_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-    if (!x11 && command_exists("xclip")) {
-        tried = 1;
-        if (run_clipboard_command(xclip_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-    if (!x11 && command_exists("xsel")) {
-        tried = 1;
-        if (run_clipboard_command(xsel_argv, data, len, last_error, sizeof(last_error)) == 0)
-            return 0;
-    }
-
-    if (!tried) {
-        (void)snprintf(why, why_size,
-            "no clipboard utility found; install wl-clipboard (Wayland), xclip or xsel (X11)");
-    } else {
-        (void)snprintf(why, why_size, "%s", last_error);
-    }
+    (void)data;
+    (void)len;
+    (void)snprintf(why, why_size,
+        "lamepaste was built without native X11 support; install libx11-dev and rebuild");
     return -1;
 }
+#endif
 
 static void print_preview(const unsigned char *data, size_t len)
 {
@@ -619,7 +967,12 @@ static int show_history(sqlite3 *db, int limit)
         fprintf(stderr, APP_NAME ": cannot query history: %s\n", sqlite3_errmsg(db));
         return -1;
     }
-    sqlite3_bind_int(stmt, 1, limit);
+    rc = sqlite3_bind_int(stmt, 1, limit);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, APP_NAME ": cannot bind history limit: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
     puts("ID\tDATE/TIME\tBYTES\tPREVIEW");
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         sqlite3_int64 id = sqlite3_column_int64(stmt, 0);
@@ -656,7 +1009,12 @@ static int show_clip(sqlite3 *db, sqlite3_int64 id)
         fprintf(stderr, APP_NAME ": cannot prepare clip lookup: %s\n", sqlite3_errmsg(db));
         return -1;
     }
-    sqlite3_bind_int64(stmt, 1, id);
+    rc = sqlite3_bind_int64(stmt, 1, id);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, APP_NAME ": cannot bind history ID: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
         if (rc == SQLITE_DONE)
@@ -675,7 +1033,7 @@ static int show_clip(sqlite3 *db, sqlite3_int64 id)
             failed = 1;
         rc = sqlite3_finalize(stmt);
         if (failed || ferror(stdout)) {
-            fprintf(stderr, APP_NAME ": writing entry to stdout failed: %s\n", strerror(errno));
+            fprintf(stderr, APP_NAME ": writing entry to stdout failed\n");
             return -1;
         }
         if (rc != SQLITE_OK) {
@@ -696,7 +1054,12 @@ static int load_clip(sqlite3 *db, sqlite3_int64 id, Buffer *out)
         fprintf(stderr, APP_NAME ": cannot prepare clip lookup: %s\n", sqlite3_errmsg(db));
         return -1;
     }
-    sqlite3_bind_int64(stmt, 1, id);
+    rc = sqlite3_bind_int64(stmt, 1, id);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, APP_NAME ": cannot bind history ID: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(stmt);
+        return -1;
+    }
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
         if (rc == SQLITE_DONE)
@@ -716,6 +1079,11 @@ static int load_clip(sqlite3 *db, sqlite3_int64 id, Buffer *out)
             return -1;
         }
         if (bytes > 0) {
+            if (blob == NULL) {
+                fprintf(stderr, APP_NAME ": database returned a NULL payload with a nonzero size\n");
+                sqlite3_finalize(stmt);
+                return -1;
+            }
             copy = malloc((size_t)bytes);
             if (copy == NULL) {
                 fprintf(stderr, APP_NAME ": not enough memory to restore entry\n");
@@ -810,7 +1178,7 @@ int main(int argc, char **argv)
         return 0;
     }
     if (action == ACTION_VERSION) {
-        puts(APP_NAME " 1.0.0");
+        puts(APP_NAME " " APP_VERSION " ---- Lamer 01101100 01100001 01101101 01100101 01110010 | Buddy 01100010 01110101 01100100 01100100 01111001");
         return 0;
     }
 
@@ -840,9 +1208,14 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    progress_start(action == ACTION_PIPE ? "Reading input" : "Restoring history entry");
     if (action == ACTION_PIPE) {
+        struct stat input_stat;
+        if (fstat(STDIN_FILENO, &input_stat) == 0 && S_ISREG(input_stat.st_mode) &&
+            input_stat.st_size > 0 && (uintmax_t)input_stat.st_size <= SIZE_MAX)
+            progress_total((size_t)input_stat.st_size);
         if (isatty(STDIN_FILENO)) {
-            fprintf(stderr, APP_NAME ": expected piped input; example: printf 'hello' | " APP_NAME "\n");
+            fprintf(stderr, APP_NAME ": expected piped or redirected input; example: printf 'hello' | " APP_NAME "\n");
             result = 2;
             goto cleanup;
         }
@@ -855,34 +1228,43 @@ int main(int argc, char **argv)
             goto cleanup;
     }
 
+    progress_phase("Saving to SQLite");
     if (insert_clip(db, input.data, input.len, &saved_id) != 0)
         goto cleanup;
 
     if (!no_clipboard) {
         char why[512];
-        /* Prevent a closed clipboard pipe from terminating the whole program. */
-        (void)signal(SIGPIPE, SIG_IGN);
+        progress_phase("Copying to clipboard");
         if (copy_to_clipboard(input.data, input.len, why, sizeof(why)) != 0) {
             fprintf(stderr,
-                APP_NAME ": saved entry #%lld (%zu bytes) to %s, but clipboard copy failed: %s\n",
-                (long long)saved_id, input.len, g_db_path, why);
+                APP_NAME ": saved entry #%lld (%zu bytes) to history, but native clipboard copy failed: %s\n",
+                (long long)saved_id, input.len, why);
             goto cleanup;
         }
     }
 
+    progress_stop();
     if (no_clipboard) {
         fprintf(stderr, APP_NAME ": saved entry #%lld (%zu bytes) to %s (clipboard skipped)\n",
                 (long long)saved_id, input.len, g_db_path);
     } else {
-        fprintf(stderr, APP_NAME ": saved entry #%lld (%zu bytes) to history and clipboard\n",
+        fprintf(stderr, APP_NAME ": saved entry #%lld (%zu bytes) to history and native clipboard\n",
                 (long long)saved_id, input.len);
     }
     result = 0;
 
 cleanup:
+    progress_stop();
     free(input.data);
-    if (db != NULL)
-        sqlite3_close(db);
+    if (db != NULL) {
+        int close_rc = sqlite3_close(db);
+        if (close_rc != SQLITE_OK) {
+            fprintf(stderr, APP_NAME ": closing SQLite database failed: %s\n",
+                    sqlite3_errstr(close_rc));
+            if (result == 0)
+                result = 1;
+        }
+    }
     free(owned_default_path);
     return result;
 }
